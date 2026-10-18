@@ -1,0 +1,200 @@
+-- | ReSure Nexus — Loss Assessment contracts.
+-- | Versioned assessments by authorized adjusters with evidence references.
+module ReSure.Assessment.LossAssessment where
+
+import ReSure.Types
+
+-- | LossAssessment — Prepared by authorized adjuster or claims specialist.
+-- | Signatory: adjuster (assessment authority)
+-- | Observer: cedant, broker, operations, audit
+template LossAssessment
+  with
+    adjuster : Party
+    cedant : Party
+    broker : Party
+    operations : Party
+    audit : Party
+    claimRef : Text              -- Associated claim reference
+    assessmentRef : Text         -- Unique assessment reference
+    assessmentVersion : Int      -- Monotonically increasing version
+    assessedAmount : MonetaryAmount  -- Assessed eligible loss
+    -- Deduction details
+    deductibleAmount : Optional MonetaryAmount
+    salvageAmount : Optional MonetaryAmount
+    subrogationAmount : Optional MonetaryAmount
+    otherRecoveries : Optional MonetaryAmount
+    eligibleLoss : MonetaryAmount  -- Final eligible loss after applicable deductions
+    -- Assessment metadata
+    methodology : Text           -- Assessment methodology description
+    lossBasisApplied : LossBasis -- Which loss basis was used
+    evidenceRefs : [EvidenceRef] -- Supporting evidence
+    assessmentStatus : AssessmentStatus
+    submittedAt : Time
+    approvedAt : Optional Time
+    approvedBy : Optional Party
+    previousVersion : Optional Text  -- Link to prior assessment ref
+    notes : Text
+  where
+    signatory adjuster
+    observer cedant, broker, operations, audit
+
+    ensure assessmentRef /= "" &&
+           claimRef /= "" &&
+           assessmentVersion > 0 &&
+           assessedAmount.amount >= 0.0 &&
+           eligibleLoss.amount >= 0.0
+
+    -- | Submit assessment for review
+    choice SubmitAssessment : ContractId LossAssessment
+      with
+        submitTime : Time
+      controller adjuster
+      do
+        assertMsg "Assessment must be in Draft state" (assessmentStatus == AssessmentDraft)
+        create this with
+          assessmentStatus = AssessmentSubmitted
+          submittedAt = submitTime
+
+    -- | Approve assessment — makes it available for allocation
+    choice ApproveAssessment : ContractId LossAssessment
+      with
+        approver : Party
+        approvalTime : Time
+      controller operations
+      do
+        assertMsg "Assessment must be in Submitted state" (assessmentStatus == AssessmentSubmitted)
+        create this with
+          assessmentStatus = AssessmentApproved
+          approvedAt = Some approvalTime
+          approvedBy = Some approver
+
+    -- | Reject assessment with reason
+    choice RejectAssessment : ContractId LossAssessment
+      with
+        rejector : Party
+        rejectionReason : Text
+        rejectTime : Time
+      controller operations
+      do
+        assertMsg "Assessment must be in Submitted state" (assessmentStatus == AssessmentSubmitted)
+        create this with
+          assessmentStatus = AssessmentRejected
+          notes = notes <> " | Rejected: " <> rejectionReason
+
+    -- | Supersede with a revised assessment
+    choice SupersedeAssessment : (ContractId LossAssessment, ContractId LossAssessment)
+      with
+        revisedAssessment : LossAssessment
+        supersedTime : Time
+      controller adjuster
+      do
+        assertMsg "Only approved or submitted assessments can be superseded"
+          (assessmentStatus == AssessmentApproved || assessmentStatus == AssessmentSubmitted)
+        -- Mark current as superseded
+        supersededId <- create this with assessmentStatus = AssessmentSuperseded
+        -- Create new version
+        newId <- create revisedAssessment with
+          assessmentVersion = assessmentVersion + 1
+          previousVersion = Some assessmentRef
+          assessmentStatus = AssessmentDraft
+        return (supersededId, newId)
+
+    -- | Add evidence to assessment
+    choice AddAssessmentEvidence : ContractId LossAssessment
+      with
+        evidence : EvidenceRef
+      controller adjuster
+      do
+        assertMsg "Cannot add evidence to superseded assessments"
+          (assessmentStatus /= AssessmentSuperseded)
+        create this with evidenceRefs = evidence :: evidenceRefs
+
+
+-- | LossOccurrence — Groups related claims from one loss event.
+-- | Membership must be frozen before final XoL allocation.
+template LossOccurrence
+  with
+    cedant : Party
+    broker : Party
+    adjuster : Party
+    operations : Party
+    audit : Party
+    occurrenceRef : Text         -- External occurrence reference
+    dateOfOccurrence : Date
+    description : Text
+    memberClaimRefs : [Text]     -- Claim references in this occurrence
+    isFrozen : Bool              -- Membership frozen for allocation
+    frozenAt : Optional Time
+    totalEligibleLoss : Optional MonetaryAmount  -- Aggregated eligible loss
+    currency : Currency
+    evidenceRefs : [EvidenceRef]
+    createdAt : Time
+  where
+    signatory cedant
+    observer broker, adjuster, operations, audit
+
+    ensure occurrenceRef /= ""
+
+    -- | Add a claim to the occurrence (before freeze)
+    choice AddClaimToOccurrence : ContractId LossOccurrence
+      with
+        claimRef : Text
+        addTime : Time
+      controller cedant
+      do
+        assertMsg "Cannot add claims to frozen occurrence" (not isFrozen)
+        assertMsg "Claim already in occurrence" (notElem claimRef memberClaimRefs)
+        assertMsg "Claim reference cannot be empty" (claimRef /= "")
+        create this with
+          memberClaimRefs = claimRef :: memberClaimRefs
+
+    -- | Remove a claim from the occurrence (before freeze)
+    choice RemoveClaimFromOccurrence : ContractId LossOccurrence
+      with
+        claimRef : Text
+        removeTime : Time
+      controller cedant
+      do
+        assertMsg "Cannot remove claims from frozen occurrence" (not isFrozen)
+        assertMsg "Claim not in occurrence" (elem claimRef memberClaimRefs)
+        create this with
+          memberClaimRefs = filter (/= claimRef) memberClaimRefs
+
+    -- | Freeze occurrence membership — required before XoL allocation
+    choice FreezeOccurrence : ContractId LossOccurrence
+      with
+        aggregatedLoss : MonetaryAmount
+        freezeTime : Time
+      controller operations
+      do
+        assertMsg "Occurrence already frozen" (not isFrozen)
+        assertMsg "Occurrence must have at least one claim" (not (null memberClaimRefs))
+        assertMsg "Aggregated loss must be non-negative" (aggregatedLoss.amount >= 0.0)
+        create this with
+          isFrozen = True
+          frozenAt = Some freezeTime
+          totalEligibleLoss = Some aggregatedLoss
+
+    -- | Add late claim via controlled correction (after freeze)
+    choice AddLateClaim : ContractId LossOccurrence
+      with
+        claimRef : Text
+        correctionReason : Text
+        newAggregatedLoss : MonetaryAmount
+        correctionTime : Time
+      controller operations
+      do
+        assertMsg "Occurrence must be frozen for late claim addition" isFrozen
+        assertMsg "Claim already in occurrence" (notElem claimRef memberClaimRefs)
+        assertMsg "Claim reference cannot be empty" (claimRef /= "")
+        create this with
+          memberClaimRefs = claimRef :: memberClaimRefs
+          totalEligibleLoss = Some newAggregatedLoss
+
+    -- | Add evidence
+    choice AddOccurrenceEvidence : ContractId LossOccurrence
+      with
+        evidence : EvidenceRef
+      controller cedant
+      do
+        create this with evidenceRefs = evidence :: evidenceRefs

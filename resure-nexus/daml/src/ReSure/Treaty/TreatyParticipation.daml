@@ -1,0 +1,138 @@
+-- | ReSure Nexus — Treaty Participation contracts.
+-- | Represents a reinsurer's accepted participation in a treaty.
+-- | Both cedant and reinsurer must agree (dual signatory).
+-- | Broker has observer role only — cannot amend reinsurer agreement.
+module ReSure.Treaty.TreatyParticipation where
+
+import ReSure.Types
+import ReSure.Treaty.TreatyVersion
+
+-- | TreatyParticipation — Reinsurer's accepted share in a treaty.
+-- | Dual signatory: cedant + reinsurer (both must agree).
+-- | Broker is observer-only, cannot modify.
+template TreatyParticipation
+  with
+    cedant : Party
+    reinsurer : Party
+    broker : Party
+    operations : Party
+    audit : Party
+    treatyVersionCid : ContractId TreatyVersion  -- Reference to accepted treaty version
+    treatyRef : Text             -- External treaty reference (for correlation)
+    treatyVersion : Int          -- Version number of the accepted treaty
+    linePercentage : Decimal     -- Reinsurer's participation line %
+    coveredLayer : Text          -- Description of covered layer
+    currency : Currency
+    isAccepted : Bool            -- Whether reinsurer has formally accepted
+    acceptedAt : Optional Time   -- Acceptance timestamp
+    evidenceRefs : [EvidenceRef] -- Participation evidence (signed slips etc.)
+    createdAt : Time
+  where
+    -- Both parties must sign — broker cannot unilaterally amend
+    signatory cedant, reinsurer
+    observer broker, operations, audit
+
+    -- Participation percentage must be valid
+    ensure linePercentage > 0.0 &&
+           linePercentage <= 100.0 &&
+           treatyRef /= ""
+
+    -- | Reinsurer formally accepts the participation terms
+    choice AcceptParticipation : ContractId TreatyParticipation
+      with
+        acceptTime : Time
+        acceptEvidence : Optional EvidenceRef
+      controller reinsurer
+      do
+        assertMsg "Participation already accepted" (not isAccepted)
+        let newEvidenceRefs = case acceptEvidence of
+              Some ev -> ev :: evidenceRefs
+              None -> evidenceRefs
+        create this with
+          isAccepted = True
+          acceptedAt = Some acceptTime
+          evidenceRefs = newEvidenceRefs
+
+    -- | Cedant can propose participation (reinsurer must then accept)
+    -- | This creates an unaccepted participation for the reinsurer to review
+    nonconsuming choice ViewParticipationTerms : TreatyParticipation
+      controller reinsurer
+      do
+        return this
+
+    -- | Add evidence to participation record
+    choice AddParticipationEvidence : ContractId TreatyParticipation
+      with
+        evidence : EvidenceRef
+        submitter : Party
+      controller submitter
+      do
+        assertMsg "Only cedant or reinsurer can add evidence"
+          (submitter == cedant || submitter == reinsurer)
+        create this with evidenceRefs = evidence :: evidenceRefs
+
+-- | Participation proposal — cedant proposes, reinsurer must accept
+-- | This is the two-step workflow: propose → accept/reject
+template TreatyParticipationProposal
+  with
+    cedant : Party
+    reinsurer : Party
+    broker : Party
+    operations : Party
+    audit : Party
+    treatyVersionCid : ContractId TreatyVersion
+    treatyRef : Text
+    treatyVersion : Int
+    proposedLinePercentage : Decimal
+    coveredLayer : Text
+    currency : Currency
+    evidenceRefs : [EvidenceRef]
+    proposedAt : Time
+  where
+    signatory cedant
+    observer broker, reinsurer, operations, audit
+
+    ensure proposedLinePercentage > 0.0 &&
+           proposedLinePercentage <= 100.0
+
+    -- | Reinsurer accepts the proposal, creating a dual-signatory participation
+    choice AcceptProposal : ContractId TreatyParticipation
+      with
+        acceptTime : Time
+        acceptEvidence : Optional EvidenceRef
+      controller reinsurer
+      do
+        let allEvidence = case acceptEvidence of
+              Some ev -> ev :: evidenceRefs
+              None -> evidenceRefs
+        create TreatyParticipation with
+          cedant = cedant
+          reinsurer = reinsurer
+          broker = broker
+          operations = operations
+          audit = audit
+          treatyVersionCid = treatyVersionCid
+          treatyRef = treatyRef
+          treatyVersion = treatyVersion
+          linePercentage = proposedLinePercentage
+          coveredLayer = coveredLayer
+          currency = currency
+          isAccepted = True
+          acceptedAt = Some acceptTime
+          evidenceRefs = allEvidence
+          createdAt = proposedAt
+
+    -- | Reinsurer rejects the proposal
+    choice RejectProposal : ()
+      with
+        rejectionReason : Text
+        rejectTime : Time
+      controller reinsurer
+      do
+        return ()
+
+    -- | Cedant withdraws the proposal
+    choice WithdrawProposal : ()
+      controller cedant
+      do
+        return ()

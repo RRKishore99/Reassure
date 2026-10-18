@@ -1,0 +1,281 @@
+-- | ReSure Nexus — Allocation contracts.
+-- | AllocationCycle, RecoverableAllocation, ReinsurerDecision, DisputeCase as per spec C.
+-- | Each allocation is bilateral (cedant + specific reinsurer).
+module ReSure.Allocation.AllocationCycle where
+
+import ReSure.Types
+import DA.Optional (isNone)
+
+-- | AllocationCycle — Captures the calculation context and results.
+-- | Records exact input versions used for reproducibility.
+template AllocationCycle
+  with
+    operations : Party
+    cedant : Party
+    broker : Party
+    audit : Party
+    cycleRef : Text              -- Unique allocation cycle reference
+    -- Input references (exact versions used)
+    claimRefs : [Text]           -- Claim references included
+    occurrenceRef : Optional Text  -- Occurrence reference (for XoL)
+    assessmentRef : Text         -- Assessment reference used
+    assessmentVersion : Int      -- Exact assessment version
+    treatyRef : Text             -- Treaty reference
+    treatyVersion : Int          -- Exact treaty version
+    -- Calculation details
+    treatyType : TreatyType
+    eligibleLoss : MonetaryAmount     -- Input eligible loss
+    calculatedRecoverable : MonetaryAmount  -- Total calculated recoverable
+    calculationEvidence : CalculationEvidence  -- Full calculation audit trail
+    currency : Currency
+    -- Status
+    allocationStatus : AllocationStatus
+    createdAt : Time
+    finalizedAt : Optional Time
+    evidenceRefs : [EvidenceRef]
+  where
+    signatory operations
+    observer cedant, broker, audit
+
+    ensure cycleRef /= "" &&
+           assessmentRef /= "" &&
+           treatyRef /= "" &&
+           eligibleLoss.amount >= 0.0
+
+    -- | Finalize allocation cycle — requires all reinsurer decisions
+    choice FinalizeAllocationCycle : ContractId AllocationCycle
+      with
+        finalizeTime : Time
+      controller operations
+      do
+        assertMsg "Allocation must be in Accepted or PendingReinsurer state"
+          (allocationStatus == AllocationAccepted || allocationStatus == AllocationPendingReinsurer)
+        create this with
+          allocationStatus = AllocationFinalized
+          finalizedAt = Some finalizeTime
+
+    -- | Mark as disputed
+    choice MarkAllocationDisputed : ContractId AllocationCycle
+      with
+        disputeTime : Time
+      controller operations
+      do
+        assertMsg "Allocation must be pending or accepted"
+          (allocationStatus == AllocationPendingReinsurer || allocationStatus == AllocationAccepted)
+        create this with
+          allocationStatus = AllocationDisputed
+
+    -- | Mark as adjusted (after recovery adjustment)
+    choice MarkAllocationAdjusted : ContractId AllocationCycle
+      with
+        adjustmentTime : Time
+      controller operations
+      do
+        create this with
+          allocationStatus = AllocationAdjusted
+
+
+-- | RecoverableAllocation — Amount allocated to a specific reinsurer.
+-- | Bilateral contract: cedant + specific reinsurer.
+-- | Does NOT expose other reinsurers' allocations.
+template RecoverableAllocation
+  with
+    cedant : Party
+    reinsurer : Party
+    broker : Party
+    operations : Party
+    audit : Party
+    allocationRef : Text         -- Unique allocation reference
+    cycleRef : Text              -- Parent allocation cycle
+    treatyRef : Text
+    treatyVersion : Int
+    claimRef : Text              -- Associated claim
+    occurrenceRef : Optional Text
+    -- Allocation details
+    allocatedAmount : MonetaryAmount    -- Amount allocated to this reinsurer
+    linePercentage : Decimal           -- Reinsurer's participation %
+    calculationEvidence : CalculationEvidence  -- Individual calculation evidence
+    -- Status
+    reinsurerDecision : Optional DecisionType
+    decisionAt : Optional Time
+    isFinalized : Bool
+    isCancelled : Bool
+    createdAt : Time
+    evidenceRefs : [EvidenceRef]
+  where
+    -- Bilateral: cedant + this specific reinsurer
+    signatory cedant, reinsurer
+    observer broker, operations, audit
+
+    ensure allocationRef /= "" &&
+           cycleRef /= "" &&
+           allocatedAmount.amount >= 0.0 &&
+           linePercentage > 0.0
+
+    -- | Reinsurer records their decision
+    choice RecordReinsurerDecision : ContractId RecoverableAllocation
+      with
+        decision : DecisionType
+        decisionTime : Time
+        decisionEvidence : Optional EvidenceRef
+      controller reinsurer
+      do
+        assertMsg "Decision already recorded" (isNone reinsurerDecision)
+        assertMsg "Cannot decide on finalized allocation" (not isFinalized)
+        assertMsg "Cannot decide on cancelled allocation" (not isCancelled)
+        let newEvidence = case decisionEvidence of
+              Some ev -> ev :: evidenceRefs
+              None -> evidenceRefs
+        create this with
+          reinsurerDecision = Some decision
+          decisionAt = Some decisionTime
+          evidenceRefs = newEvidence
+
+    -- | Finalize this allocation (after reinsurer acceptance)
+    choice FinalizeAllocation : ContractId RecoverableAllocation
+      with
+        finalizeTime : Time
+      controller operations
+      do
+        assertMsg "Reinsurer must have accepted" (reinsurerDecision == Some DecisionAccept)
+        assertMsg "Already finalized" (not isFinalized)
+        create this with
+          isFinalized = True
+
+    -- | Cancel allocation (e.g., after dispute resolution)
+    choice CancelAllocation : ContractId RecoverableAllocation
+      with
+        cancellationReason : Text
+        cancelTime : Time
+      controller operations
+      do
+        assertMsg "Cannot cancel finalized allocation" (not isFinalized)
+        create this with isCancelled = True
+
+-- | Allocation proposal — operations proposes, reinsurer must accept/dispute
+-- | This implements the controlled allocation workflow.
+template AllocationProposal
+  with
+    cedant : Party
+    reinsurer : Party
+    broker : Party
+    operations : Party
+    audit : Party
+    allocationRef : Text
+    cycleRef : Text
+    treatyRef : Text
+    treatyVersion : Int
+    claimRef : Text
+    occurrenceRef : Optional Text
+    allocatedAmount : MonetaryAmount
+    linePercentage : Decimal
+    calculationEvidence : CalculationEvidence
+    evidenceRefs : [EvidenceRef]
+    proposedAt : Time
+  where
+    signatory cedant
+    observer reinsurer, broker, operations, audit
+
+    ensure allocationRef /= "" &&
+           allocatedAmount.amount >= 0.0
+
+    -- | Reinsurer accepts — creates dual-signatory RecoverableAllocation
+    choice AcceptAllocationProposal : ContractId RecoverableAllocation
+      with
+        acceptTime : Time
+        acceptEvidence : Optional EvidenceRef
+      controller reinsurer
+      do
+        let allEvidence = case acceptEvidence of
+              Some ev -> ev :: evidenceRefs
+              None -> evidenceRefs
+        create RecoverableAllocation with
+          cedant = cedant
+          reinsurer = reinsurer
+          broker = broker
+          operations = operations
+          audit = audit
+          allocationRef = allocationRef
+          cycleRef = cycleRef
+          treatyRef = treatyRef
+          treatyVersion = treatyVersion
+          claimRef = claimRef
+          occurrenceRef = occurrenceRef
+          allocatedAmount = allocatedAmount
+          linePercentage = linePercentage
+          calculationEvidence = calculationEvidence
+          reinsurerDecision = Some DecisionAccept
+          decisionAt = Some acceptTime
+          isFinalized = False
+          isCancelled = False
+          createdAt = proposedAt
+          evidenceRefs = allEvidence
+
+    -- | Reinsurer disputes — creates a dispute case
+    choice DisputeAllocationProposal : ContractId RecoverableAllocation
+      with
+        disputeReason : Text
+        disputedAmount : Optional MonetaryAmount
+        disputeTime : Time
+        disputeEvidence : Optional EvidenceRef
+      controller reinsurer
+      do
+        let allEvidence = case disputeEvidence of
+              Some ev -> ev :: evidenceRefs
+              None -> evidenceRefs
+        create RecoverableAllocation with
+          cedant = cedant
+          reinsurer = reinsurer
+          broker = broker
+          operations = operations
+          audit = audit
+          allocationRef = allocationRef
+          cycleRef = cycleRef
+          treatyRef = treatyRef
+          treatyVersion = treatyVersion
+          claimRef = claimRef
+          occurrenceRef = occurrenceRef
+          allocatedAmount = allocatedAmount
+          linePercentage = linePercentage
+          calculationEvidence = calculationEvidence
+          reinsurerDecision = Some DecisionDispute
+          decisionAt = Some disputeTime
+          isFinalized = False
+          isCancelled = False
+          createdAt = proposedAt
+          evidenceRefs = allEvidence
+
+    -- | Reinsurer requests additional information
+    choice RequestInfoOnAllocation : ContractId RecoverableAllocation
+      with
+        infoRequest : Text
+        requestTime : Time
+      controller reinsurer
+      do
+        create RecoverableAllocation with
+          cedant = cedant
+          reinsurer = reinsurer
+          broker = broker
+          operations = operations
+          audit = audit
+          allocationRef = allocationRef
+          cycleRef = cycleRef
+          treatyRef = treatyRef
+          treatyVersion = treatyVersion
+          claimRef = claimRef
+          occurrenceRef = occurrenceRef
+          allocatedAmount = allocatedAmount
+          linePercentage = linePercentage
+          calculationEvidence = calculationEvidence
+          reinsurerDecision = Some DecisionRequestInfo
+          decisionAt = Some requestTime
+          isFinalized = False
+          isCancelled = False
+          createdAt = proposedAt
+          evidenceRefs = evidenceRefs
+
+    -- | Operations withdraws the proposal
+    choice WithdrawAllocationProposal : ()
+      controller operations
+      do
+        return ()

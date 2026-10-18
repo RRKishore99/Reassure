@@ -1,0 +1,201 @@
+-- | ReSure Nexus — Claim intake and evidence contracts.
+-- | ClaimCase, ClaimEvidenceManifest, LossOccurrence as per spec section B.
+-- | Personal claimant details kept off-ledger; only opaque identifiers used.
+module ReSure.Claim.ClaimCase where
+
+import ReSure.Types
+
+-- | ClaimCase — Individual claim reported by the Cedant.
+-- | Signatory: cedant (claim owner)
+-- | Observer: broker, adjuster, operations, audit
+-- | Reinsurers do NOT see claims until allocation — privacy boundary.
+template ClaimCase
+  with
+    cedant : Party
+    broker : Party
+    adjuster : Party
+    operations : Party
+    audit : Party
+    claimRef : Text             -- External claim reference (opaque)
+    policyRef : Text            -- Policy reference (opaque)
+    dateOfLoss : Date
+    occurrenceRef : Optional Text  -- Occurrence reference if applicable
+    grossAmount : MonetaryAmount   -- Gross incurred amount
+    netAmount : Optional MonetaryAmount  -- Net of deductibles if applicable
+    applicableTreatyRefs : [Text]  -- Treaty references this claim may fall under
+    claimStatus : ClaimStatus
+    evidenceRefs : [EvidenceRef]   -- Evidence manifest references
+    submittedAt : Time
+    submittedBy : Party
+    lastUpdatedAt : Time
+    notes : Text                -- Operational notes
+  where
+    signatory cedant
+    observer broker, adjuster, operations, audit
+
+    ensure claimRef /= "" &&
+           policyRef /= "" &&
+           grossAmount.amount >= 0.0
+
+    -- | Move claim to under-assessment status
+    choice SubmitForAssessment : ContractId ClaimCase
+      with
+        submissionTime : Time
+      controller cedant
+      do
+        assertMsg "Claim must be in Submitted state" (claimStatus == ClaimSubmitted)
+        create this with
+          claimStatus = ClaimUnderAssessment
+          lastUpdatedAt = submissionTime
+
+    -- | Mark claim as assessed (triggered after assessment approval)
+    choice MarkClaimAssessed : ContractId ClaimCase
+      with
+        assessmentTime : Time
+      controller operations
+      do
+        assertMsg "Claim must be under assessment" (claimStatus == ClaimUnderAssessment)
+        create this with
+          claimStatus = ClaimAssessed
+          lastUpdatedAt = assessmentTime
+
+    -- | Mark claim as allocated
+    choice MarkClaimAllocated : ContractId ClaimCase
+      with
+        allocationTime : Time
+      controller operations
+      do
+        assertMsg "Claim must be assessed" (claimStatus == ClaimAssessed || claimStatus == ClaimAllocated)
+        create this with
+          claimStatus = ClaimAllocated
+          lastUpdatedAt = allocationTime
+
+    -- | Mark claim as partially settled
+    choice MarkClaimPartiallySettled : ContractId ClaimCase
+      with
+        settlementTime : Time
+      controller operations
+      do
+        assertMsg "Claim must be allocated or already partially settled"
+          (claimStatus == ClaimAllocated || claimStatus == ClaimPartiallySettled)
+        create this with
+          claimStatus = ClaimPartiallySettled
+          lastUpdatedAt = settlementTime
+
+    -- | Mark claim as fully settled
+    choice MarkClaimFullySettled : ContractId ClaimCase
+      with
+        settlementTime : Time
+      controller operations
+      do
+        assertMsg "Claim must be allocated or partially settled"
+          (claimStatus == ClaimAllocated || claimStatus == ClaimPartiallySettled)
+        create this with
+          claimStatus = ClaimFullySettled
+          lastUpdatedAt = settlementTime
+
+    -- | Close the claim
+    choice CloseClaim : ContractId ClaimCase
+      with
+        closeTime : Time
+      controller cedant
+      do
+        assertMsg "Claim must be fully settled to close" (claimStatus == ClaimFullySettled)
+        create this with
+          claimStatus = ClaimClosed
+          lastUpdatedAt = closeTime
+
+    -- | Reopen a closed claim
+    choice ReopenClaim : ContractId ClaimCase
+      with
+        reopenTime : Time
+        reason : Text
+      controller cedant
+      do
+        assertMsg "Only closed claims can be reopened" (claimStatus == ClaimClosed)
+        create this with
+          claimStatus = ClaimReopened
+          lastUpdatedAt = reopenTime
+          notes = notes <> " | Reopened: " <> reason
+
+    -- | Add evidence to claim
+    choice AddClaimEvidence : ContractId ClaimCase
+      with
+        evidence : EvidenceRef
+      controller cedant
+      do
+        create this with evidenceRefs = evidence :: evidenceRefs
+
+    -- | Update gross amount (controlled amendment)
+    choice UpdateClaimAmount : ContractId ClaimCase
+      with
+        newGrossAmount : MonetaryAmount
+        newNetAmount : Optional MonetaryAmount
+        updateTime : Time
+        updateEvidence : EvidenceRef
+      controller cedant
+      do
+        assertMsg "Cannot update amount on closed claims" (claimStatus /= ClaimClosed)
+        assertMsg "Amount must be non-negative" (newGrossAmount.amount >= 0.0)
+        create this with
+          grossAmount = newGrossAmount
+          netAmount = newNetAmount
+          lastUpdatedAt = updateTime
+          evidenceRefs = updateEvidence :: evidenceRefs
+
+
+-- | ClaimEvidenceManifest — Records evidence document metadata.
+-- | Content stored off-ledger; only hash and references on-ledger.
+template ClaimEvidenceManifest
+  with
+    owner : Party              -- Document owner
+    operations : Party
+    audit : Party
+    claimRef : Text            -- Associated claim reference
+    documentType : DocumentType
+    contentHash : Text         -- SHA-256 hex digest
+    documentVersion : Int      -- Document version
+    documentId : Text          -- Opaque storage identifier
+    uploadedAt : Time
+    uploadedBy : Party
+    verifiedAt : Optional Time
+    verifiedBy : Optional Party
+    description : Text
+  where
+    signatory owner
+    observer operations, audit
+
+    ensure contentHash /= "" &&
+           documentId /= "" &&
+           claimRef /= "" &&
+           documentVersion > 0
+
+    -- | Verify evidence integrity
+    choice VerifyEvidence : ContractId ClaimEvidenceManifest
+      with
+        verifier : Party
+        verifyTime : Time
+      controller verifier
+      do
+        assertMsg "Only operations or audit can verify"
+          (verifier == operations || verifier == audit)
+        create this with
+          verifiedAt = Some verifyTime
+          verifiedBy = Some verifier
+
+    -- | Supersede with new version
+    choice SupersedeEvidence : ContractId ClaimEvidenceManifest
+      with
+        newHash : Text
+        newVersion : Int
+        updateTime : Time
+      controller owner
+      do
+        assertMsg "New version must be higher" (newVersion > documentVersion)
+        assertMsg "Hash cannot be empty" (newHash /= "")
+        create this with
+          contentHash = newHash
+          documentVersion = newVersion
+          uploadedAt = updateTime
+          verifiedAt = None
+          verifiedBy = None

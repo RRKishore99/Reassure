@@ -1,0 +1,127 @@
+-- | ReSure Nexus — Business identity registry and duplicate prevention.
+-- | Ledger-enforced protection against reuse of business references.
+-- | Consumption-based design: unique contract IDs ≠ unique business identifiers.
+module ReSure.Registry.UniqueRegistry where
+
+
+-- | ClaimRegistry — Prevents duplicate claim references within scope.
+-- | Consumption-based: creating a registration consumes a "slot",
+-- | preventing concurrent duplicate creation.
+template ClaimRegistry
+  with
+    registrar : Party           -- Usually operations
+    cedant : Party
+    audit : Party
+    claimRef : Text             -- The unique business reference
+    policyRef : Text
+    registeredAt : Time
+    isActive : Bool
+  where
+    signatory registrar
+    observer cedant, audit
+
+    key (registrar, claimRef) : (Party, Text)
+    maintainer key._1
+
+    ensure claimRef /= ""
+
+    -- | Deactivate a claim registration (for controlled amendments)
+    choice DeactivateClaimRegistration : ContractId ClaimRegistry
+      with
+        deactivateTime : Time
+        reason : Text
+      controller registrar
+      do
+        assertMsg "Registration must be active" isActive
+        create this with isActive = False
+
+-- | AllocationRegistry — Prevents duplicate allocations for same claim/treaty/reinsurer.
+-- | Key enforces uniqueness at the ledger level.
+template AllocationRegistry
+  with
+    registrar : Party
+    cedant : Party
+    reinsurer : Party
+    audit : Party
+    claimRef : Text
+    treatyRef : Text
+    treatyVersion : Int
+    allocationRef : Text
+    registeredAt : Time
+    isActive : Bool
+  where
+    signatory registrar
+    observer cedant, reinsurer, audit
+
+    -- Composite key: prevents same claim+treaty+reinsurer allocation
+    key (registrar, claimRef, treatyRef, reinsurer) : (Party, Text, Text, Party)
+    maintainer key._1
+
+    ensure claimRef /= "" &&
+           treatyRef /= "" &&
+           allocationRef /= ""
+
+    -- | Deactivate (for correction workflows)
+    choice DeactivateAllocationRegistration : ContractId AllocationRegistry
+      with
+        deactivateTime : Time
+        reason : Text
+      controller registrar
+      do
+        assertMsg "Registration must be active" isActive
+        create this with isActive = False
+
+-- | OccurrenceRegistry — Prevents duplicate occurrence references.
+template OccurrenceRegistry
+  with
+    registrar : Party
+    cedant : Party
+    audit : Party
+    occurrenceRef : Text
+    registeredAt : Time
+    isActive : Bool
+  where
+    signatory registrar
+    observer cedant, audit
+
+    key (registrar, occurrenceRef) : (Party, Text)
+    maintainer key._1
+
+    ensure occurrenceRef /= ""
+
+    choice DeactivateOccurrenceRegistration : ContractId OccurrenceRegistry
+      with
+        deactivateTime : Time
+      controller registrar
+      do
+        assertMsg "Registration must be active" isActive
+        create this with isActive = False
+
+-- | SettlementRegistry — Prevents duplicate settlement references.
+template SettlementRegistry
+  with
+    registrar : Party
+    cedant : Party
+    reinsurer : Party
+    audit : Party
+    settlementRef : Text
+    allocationRef : Text
+    registeredAt : Time
+    isActive : Bool
+  where
+    signatory registrar
+    observer cedant, reinsurer, audit
+
+    key (registrar, settlementRef) : (Party, Text)
+    maintainer key._1
+
+    ensure settlementRef /= "" &&
+           allocationRef /= ""
+
+    choice DeactivateSettlementRegistration : ContractId SettlementRegistry
+      with
+        deactivateTime : Time
+      controller registrar
+      do
+        assertMsg "Registration must be active" isActive
+        create this with isActive = False

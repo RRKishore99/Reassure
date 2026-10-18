@@ -1,0 +1,27 @@
+{
+  "name": "resure-nexus",
+  "private": true,
+  "version": "1.0.0",
+  "description": "ReSure Nexus — Advanced Reinsurance Recoverables & Multi-Party Loss Allocation Network",
+  "workspaces": [
+    "apps/web",
+    "apps/api",
+    "packages/domain",
+    "packages/ledger-client",
+    "packages/document-store",
+    "packages/projections"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "dev:api": "npm run dev --workspace=apps/api",
+    "dev:web": "npm run dev --workspace=apps/web",
+    "test": "npm run test --workspaces",
+    "lint": "npm run lint --workspaces",
+    "typecheck": "npm run typecheck --workspaces",
+    "daml:build": "cd daml && daml build",
+    "daml:test": "cd daml && daml test"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

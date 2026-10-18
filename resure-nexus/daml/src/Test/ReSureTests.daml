@@ -1,0 +1,1259 @@
+-- | ReSure Nexus — Comprehensive Daml Script Tests
+-- | Tests all permitted and prohibited state transitions, authorization rules,
+-- | numerical boundaries, duplicate handling, and privacy constraints.
+module Test.ReSureTests where
+
+import Daml.Script
+import DA.Date (date, Month(..))
+import DA.Time (time)
+import ReSure.Types
+import ReSure.Treaty.TreatyVersion
+import ReSure.Treaty.TreatyParticipation
+import ReSure.Claim.ClaimCase
+import ReSure.Assessment.LossAssessment
+import ReSure.Allocation.AllocationCycle
+import ReSure.Allocation.Disputes
+import ReSure.Settlement.Settlement
+import ReSure.Registry.UniqueRegistry
+
+-- | Helper: Create standard test parties
+data TestParties = TestParties with
+    cedant : Party
+    reinsurer1 : Party
+    reinsurer2 : Party
+    broker : Party
+    adjuster : Party
+    operations : Party
+    audit : Party
+
+setupParties : Script TestParties
+setupParties = do
+  cedant <- allocateParty "Cedant"
+  reinsurer1 <- allocateParty "Reinsurer1"
+  reinsurer2 <- allocateParty "Reinsurer2"
+  broker <- allocateParty "Broker"
+  adjuster <- allocateParty "Adjuster"
+  operations <- allocateParty "Operations"
+  audit <- allocateParty "Audit"
+  return TestParties{..}
+
+-- | Helper: Create a standard test evidence reference
+testEvidence : Party -> Time -> EvidenceRef
+testEvidence party t = EvidenceRef with
+    documentId = "DOC-001"
+    documentType = ClaimNotification
+    contentHash = "a948904f2f0f479b8f8564e9d3b2a72e5e3f5e7d8c9a4b3c2d1e0f1a2b3c4d5e"
+    version = 1
+    uploadedAt = t
+    uploadedBy = party
+
+-- | Helper: Create a standard MonetaryAmount
+usd : Decimal -> MonetaryAmount
+usd amount = MonetaryAmount amount USD
+
+-- =============================================================================
+-- TREATY TESTS
+-- =============================================================================
+
+-- | Test: Create and approve a quota-share treaty
+testCreateQuotaShareTreaty : Script ()
+testCreateQuotaShareTreaty = do
+  tp <- setupParties
+  let now = time (date 2024 Jan 15) 10 0 0
+
+  -- Create treaty version
+  treatyCid <- submit tp.cedant do
+    createCmd TreatyVersion with
+      cedant = tp.cedant
+      broker = tp.broker
+      operations = tp.operations
+      audit = tp.audit
+      treatyRef = "QS-2024-001"
+      version = 1
+      treatyType = QuotaShare
+      effectivePeriod = DateRange (date 2024 Jan 1) (date 2024 Dec 31)
+      coveredBusiness = "Property lines"
+      lossBasis = GrossLoss
+      currency = USD
+      cededPercentage = Some 70.0
+      contractualCap = Some 5000000.0
+      attachmentPoint = None
+      layerLimit = None
+      deductibleRules = "Standard policyholder deductible applies"
+      eligibleLossMethod = "Gross loss less applicable deductible"
+      approvalState = ApprovalPending
+      evidenceRefs = []
+      createdAt = now
+      previousVersion = None
+
+  -- Approve the treaty
+  approvedTreatyCid <- submit tp.cedant do
+    exerciseCmd treatyCid ApproveTreaty with
+      approver = tp.cedant
+      approvalTime = now
+
+  return ()
+
+-- | Test: Create excess-of-loss treaty
+testCreateXoLTreaty : Script ()
+testCreateXoLTreaty = do
+  tp <- setupParties
+  let now = time (date 2024 Jan 15) 10 0 0
+
+  treatyCid <- submit tp.cedant do
+    createCmd TreatyVersion with
+      cedant = tp.cedant
+      broker = tp.broker
+      operations = tp.operations
+      audit = tp.audit
+      treatyRef = "XOL-2024-001"
+      version = 1
+      treatyType = ExcessOfLoss
+      effectivePeriod = DateRange (date 2024 Jan 1) (date 2024 Dec 31)
+      coveredBusiness = "Property catastrophe"
+      lossBasis = NetOfDeductible
+      currency = USD
+      cededPercentage = None
+      contractualCap = None
+      attachmentPoint = Some 1000000.0
+      layerLimit = Some 4000000.0
+      deductibleRules = "Occurrence attachment: 1,000,000"
+      eligibleLossMethod = "Per-occurrence excess of loss"
+      approvalState = ApprovalPending
+      evidenceRefs = []
+      createdAt = now
+      previousVersion = None
+
+  return ()
+
+-- | Test: Cannot approve already-approved treaty
+testCannotDoubleApproveTreaty : Script ()
+testCannotDoubleApproveTreaty = do
+  tp <- setupParties
+  let now = time (date 2024 Jan 15) 10 0 0
+
+  treatyCid <- submit tp.cedant do
+    createCmd TreatyVersion with
+      cedant = tp.cedant
+      broker = tp.broker
+      operations = tp.operations
+      audit = tp.audit
+      treatyRef = "QS-2024-002"
+      version = 1
+      treatyType = QuotaShare
+      effectivePeriod = DateRange (date 2024 Jan 1) (date 2024 Dec 31)
+      coveredBusiness = "Marine"
+      lossBasis = GrossLoss
+      currency = USD
+      cededPercentage = Some 50.0
+      contractualCap = None
+      attachmentPoint = None
+      layerLimit = None
+      deductibleRules = "None"
+      eligibleLossMethod = "Gross loss"
+      approvalState = ApprovalPending
+      evidenceRefs = []
+      createdAt = now
+      previousVersion = None
+
+  approvedCid <- submit tp.cedant do
+    exerciseCmd treatyCid ApproveTreaty with
+      approver = tp.cedant
+      approvalTime = now
+
+  -- Second approval should fail
+  submitMustFail tp.cedant do
+    exerciseCmd approvedCid ApproveTreaty with
+      approver = tp.cedant
+      approvalTime = now
+
+  return ()
+
+-- | Test: Treaty participation proposal and acceptance workflow
+testTreatyParticipationWorkflow : Script ()
+testTreatyParticipationWorkflow = do
+  tp <- setupParties
+  let now = time (date 2024 Jan 15) 10 0 0
+
+  -- Create and approve treaty
+  treatyCid <- submit tp.cedant do
+    createCmd TreatyVersion with
+      cedant = tp.cedant
+      broker = tp.broker
+      operations = tp.operations
+      audit = tp.audit
+      treatyRef = "QS-2024-003"
+      version = 1
+      treatyType = QuotaShare
+      effectivePeriod = DateRange (date 2024 Jan 1) (date 2024 Dec 31)
+      coveredBusiness = "Property"
+      lossBasis = GrossLoss
+      currency = USD
+      cededPercentage = Some 70.0
+      contractualCap = Some 5000000.0
+      attachmentPoint = None
+      layerLimit = None
+      deductibleRules = "Standard"
+      eligibleLossMethod = "Gross loss"
+      approvalState = ApprovalPending
+      evidenceRefs = []
+      createdAt = now
+      previousVersion = None
+
+  approvedTreatyCid <- submit tp.cedant do
+    exerciseCmd treatyCid ApproveTreaty with
+      approver = tp.cedant
+      approvalTime = now
+
+  -- Propose participation to reinsurer1
+  proposalCid <- submit tp.cedant do
+    createCmd TreatyParticipationProposal with
+      cedant = tp.cedant
+      reinsurer = tp.reinsurer1
+      broker = tp.broker
+      operations = tp.operations
+      audit = tp.audit
+      treatyVersionCid = approvedTreatyCid
+      treatyRef = "QS-2024-003"
+      treatyVersion = 1
+      proposedLinePercentage = 40.0
+      coveredLayer = "100% of ceded amount"
+      currency = USD
+      evidenceRefs = []
+      proposedAt = now
+
+  -- Reinsurer accepts
+  participationCid <- submit tp.reinsurer1 do
+    exerciseCmd proposalCid AcceptProposal with
+      acceptTime = now
+      acceptEvidence = None
+
+  return ()
+
+-- | Test: Reinsurer can reject participation proposal
+testReinsurerRejectsProposal : Script ()
+testReinsurerRejectsProposal = do
+  tp <- setupParties
+  let now = time (date 2024 Jan 15) 10 0 0
+
+  treatyCid <- submit tp.cedant do
+    createCmd TreatyVersion with
+      cedant = tp.cedant
+      broker = tp.broker
+      operations = tp.operations
+      audit = tp.audit
+      treatyRef = "QS-2024-004"
+      version = 1
+      treatyType = QuotaShare
+      effectivePeriod = DateRange (date 2024 Jan 1) (date 2024 Dec 31)
+      coveredBusiness = "Aviation"
+      lossBasis = GrossLoss
+      currency = USD
+      cededPercentage = Some 60.0
+      contractualCap = None
+      attachmentPoint = None
+      layerLimit = None
+      deductibleRules = "None"
+      eligibleLossMethod = "Gross loss"
+      approvalState = ApprovalPending
+      evidenceRefs = []
+      createdAt = now
+      previousVersion = None
+
+  approvedCid <- submit tp.cedant do
+    exerciseCmd treatyCid ApproveTreaty with
+      approver = tp.cedant
+      approvalTime = now
+
+  proposalCid <- submit tp.cedant do
+    createCmd TreatyParticipationProposal with
+      cedant = tp.cedant
+      reinsurer = tp.reinsurer1
+      broker = tp.broker
+      operations = tp.operations
+      audit = tp.audit
+      treatyVersionCid = approvedCid
+      treatyRef = "QS-2024-004"
+      treatyVersion = 1
+      proposedLinePercentage = 50.0
+      coveredLayer = "Full layer"
+      currency = USD
+      evidenceRefs = []
+      proposedAt = now
+
+  -- Reinsurer rejects
+  submit tp.reinsurer1 do
+    exerciseCmd proposalCid RejectProposal with
+      rejectionReason = "Terms not acceptable"
+      rejectTime = now
+
+  return ()
+
+-- | Test: Broker cannot unilaterally accept on reinsurer's behalf
+testBrokerCannotAcceptForReinsurer : Script ()
+testBrokerCannotAcceptForReinsurer = do
+  tp <- setupParties
+  let now = time (date 2024 Jan 15) 10 0 0
+
+  treatyCid <- submit tp.cedant do
+    createCmd TreatyVersion with
+      cedant = tp.cedant
+      broker = tp.broker
+      operations = tp.operations
+      audit = tp.audit
+      treatyRef = "QS-2024-005"
+      version = 1
+      treatyType = QuotaShare
+      effectivePeriod = DateRange (date 2024 Jan 1) (date 2024 Dec 31)
+      coveredBusiness = "Marine"
+      lossBasis = GrossLoss
+      currency = USD
+      cededPercentage = Some 50.0
+      contractualCap = None
+      attachmentPoint = None
+      layerLimit = None
+      deductibleRules = "None"
+      eligibleLossMethod = "Gross loss"
+      approvalState = ApprovalPending
+      evidenceRefs = []
+      createdAt = now
+      previousVersion = None
+
+  approvedCid <- submit tp.cedant do
+    exerciseCmd treatyCid ApproveTreaty with
+      approver = tp.cedant
+      approvalTime = now
+
+  proposalCid <- submit tp.cedant do
+    createCmd TreatyParticipationProposal with
+      cedant = tp.cedant
+      reinsurer = tp.reinsurer1
+      broker = tp.broker
+      operations = tp.operations
+      audit = tp.audit
+      treatyVersionCid = approvedCid
+      treatyRef = "QS-2024-005"
+      treatyVersion = 1
+      proposedLinePercentage = 50.0
+      coveredLayer = "Full"
+      currency = USD
+      evidenceRefs = []
+      proposedAt = now
+
+  -- Broker tries to accept — must fail
+  submitMustFail tp.broker do
+    exerciseCmd proposalCid AcceptProposal with
+      acceptTime = now
+      acceptEvidence = None
+
+  return ()
+
+-- =============================================================================
+-- CLAIM TESTS
+-- =============================================================================
+
+-- | Test: Full claim lifecycle
+testClaimLifecycle : Script ()
+testClaimLifecycle = do
+  tp <- setupParties
+  let now = time (date 2024 Mar 1) 10 0 0
+
+  -- Submit claim
+  claimCid <- submit tp.cedant do
+    createCmd ClaimCase with
+      cedant = tp.cedant
+      broker = tp.broker
+      adjuster = tp.adjuster
+      operations = tp.operations
+      audit = tp.audit
+      claimRef = "CLM-2024-001"
+      policyRef = "POL-2024-100"
+      dateOfLoss = date 2024 Feb 15
+      occurrenceRef = None
+      grossAmount = usd 500000.0
+      netAmount = None
+      applicableTreatyRefs = ["QS-2024-003"]
+      claimStatus = ClaimSubmitted
+      evidenceRefs = [testEvidence tp.cedant now]
+      submittedAt = now
+      submittedBy = tp.cedant
+      lastUpdatedAt = now
+      notes = "Fire damage to warehouse"
+
+  -- Submit for assessment
+  assessingCid <- submit tp.cedant do
+    exerciseCmd claimCid SubmitForAssessment with
+      submissionTime = now
+
+  -- Mark assessed
+  assessedCid <- submit tp.operations do
+    exerciseCmd assessingCid MarkClaimAssessed with
+      assessmentTime = now
+
+  -- Mark allocated
+  allocatedCid <- submit tp.operations do
+    exerciseCmd assessedCid MarkClaimAllocated with
+      allocationTime = now
+
+  -- Mark fully settled
+  settledCid <- submit tp.operations do
+    exerciseCmd allocatedCid MarkClaimFullySettled with
+      settlementTime = now
+
+  -- Close claim
+  closedCid <- submit tp.cedant do
+    exerciseCmd settledCid CloseClaim with
+      closeTime = now
+
+  return ()
+
+-- | Test: Cannot skip claim states
+testCannotSkipClaimStates : Script ()
+testCannotSkipClaimStates = do
+  tp <- setupParties
+  let now = time (date 2024 Mar 1) 10 0 0
+
+  claimCid <- submit tp.cedant do
+    createCmd ClaimCase with
+      cedant = tp.cedant
+      broker = tp.broker
+      adjuster = tp.adjuster
+      operations = tp.operations
+      audit = tp.audit
+      claimRef = "CLM-2024-002"
+      policyRef = "POL-2024-101"
+      dateOfLoss = date 2024 Feb 20
+      occurrenceRef = None
+      grossAmount = usd 100000.0
+      netAmount = None
+      applicableTreatyRefs = []
+      claimStatus = ClaimSubmitted
+      evidenceRefs = []
+      submittedAt = now
+      submittedBy = tp.cedant
+      lastUpdatedAt = now
+      notes = ""
+
+  -- Cannot directly mark as assessed (must go through SubmitForAssessment first)
+  submitMustFail tp.operations do
+    exerciseCmd claimCid MarkClaimAssessed with
+      assessmentTime = now
+
+  -- Cannot close a submitted claim
+  submitMustFail tp.cedant do
+    exerciseCmd claimCid CloseClaim with
+      closeTime = now
+
+  return ()
+
+-- | Test: Reopen closed claim
+testReopenClosedClaim : Script ()
+testReopenClosedClaim = do
+  tp <- setupParties
+  let now = time (date 2024 Mar 1) 10 0 0
+
+  -- Create and fully lifecycle a claim
+  claimCid <- submit tp.cedant do
+    createCmd ClaimCase with
+      cedant = tp.cedant
+      broker = tp.broker
+      adjuster = tp.adjuster
+      operations = tp.operations
+      audit = tp.audit
+      claimRef = "CLM-2024-003"
+      policyRef = "POL-2024-102"
+      dateOfLoss = date 2024 Feb 25
+      occurrenceRef = None
+      grossAmount = usd 200000.0
+      netAmount = None
+      applicableTreatyRefs = []
+      claimStatus = ClaimSubmitted
+      evidenceRefs = []
+      submittedAt = now
+      submittedBy = tp.cedant
+      lastUpdatedAt = now
+      notes = ""
+
+  assessingCid <- submit tp.cedant do
+    exerciseCmd claimCid SubmitForAssessment with submissionTime = now
+  assessedCid <- submit tp.operations do
+    exerciseCmd assessingCid MarkClaimAssessed with assessmentTime = now
+  allocatedCid <- submit tp.operations do
+    exerciseCmd assessedCid MarkClaimAllocated with allocationTime = now
+  settledCid <- submit tp.operations do
+    exerciseCmd allocatedCid MarkClaimFullySettled with settlementTime = now
+  closedCid <- submit tp.cedant do
+    exerciseCmd settledCid CloseClaim with closeTime = now
+
+  -- Reopen
+  reopenedCid <- submit tp.cedant do
+    exerciseCmd closedCid ReopenClaim with
+      reopenTime = now
+      reason = "New evidence discovered"
+
+  return ()
+
+-- =============================================================================
+-- ASSESSMENT TESTS
+-- =============================================================================
+
+-- | Test: Assessment lifecycle — draft → submitted → approved
+testAssessmentLifecycle : Script ()
+testAssessmentLifecycle = do
+  tp <- setupParties
+  let now = time (date 2024 Mar 5) 10 0 0
+
+  -- Create assessment
+  assessmentCid <- submit tp.adjuster do
+    createCmd LossAssessment with
+      adjuster = tp.adjuster
+      cedant = tp.cedant
+      broker = tp.broker
+      operations = tp.operations
+      audit = tp.audit
+      claimRef = "CLM-2024-001"
+      assessmentRef = "ASS-2024-001"
+      assessmentVersion = 1
+      assessedAmount = usd 500000.0
+      deductibleAmount = Some (usd 25000.0)
+      salvageAmount = None
+      subrogationAmount = None
+      otherRecoveries = None
+      eligibleLoss = usd 475000.0
+      methodology = "On-site inspection with independent valuation"
+      lossBasisApplied = NetOfDeductible
+      evidenceRefs = [testEvidence tp.adjuster now]
+      assessmentStatus = AssessmentDraft
+      submittedAt = now
+      approvedAt = None
+      approvedBy = None
+      previousVersion = None
+      notes = ""
+
+  -- Submit
+  submittedCid <- submit tp.adjuster do
+    exerciseCmd assessmentCid SubmitAssessment with
+      submitTime = now
+
+  -- Approve
+  approvedCid <- submit tp.operations do
+    exerciseCmd submittedCid ApproveAssessment with
+      approver = tp.operations
+      approvalTime = now
+
+  return ()
+
+-- | Test: Cannot approve draft assessment
+testCannotApproveDraftAssessment : Script ()
+testCannotApproveDraftAssessment = do
+  tp <- setupParties
+  let now = time (date 2024 Mar 5) 10 0 0
+
+  assessmentCid <- submit tp.adjuster do
+    createCmd LossAssessment with
+      adjuster = tp.adjuster
+      cedant = tp.cedant
+      broker = tp.broker
+      operations = tp.operations
+      audit = tp.audit
+      claimRef = "CLM-2024-001"
+      assessmentRef = "ASS-2024-002"
+      assessmentVersion = 1
+      assessedAmount = usd 300000.0
+      deductibleAmount = None
+      salvageAmount = None
+      subrogationAmount = None
+      otherRecoveries = None
+      eligibleLoss = usd 300000.0
+      methodology = "Desk assessment"
+      lossBasisApplied = GrossLoss
+      evidenceRefs = []
+      assessmentStatus = AssessmentDraft
+      submittedAt = now
+      approvedAt = None
+      approvedBy = None
+      previousVersion = None
+      notes = ""
+
+  -- Cannot approve a draft directly
+  submitMustFail tp.operations do
+    exerciseCmd assessmentCid ApproveAssessment with
+      approver = tp.operations
+      approvalTime = now
+
+  return ()
+
+-- =============================================================================
+-- OCCURRENCE TESTS
+-- =============================================================================
+
+-- | Test: Loss occurrence with frozen membership
+testLossOccurrenceFreeze : Script ()
+testLossOccurrenceFreeze = do
+  tp <- setupParties
+  let now = time (date 2024 Mar 10) 10 0 0
+
+  occCid <- submit tp.cedant do
+    createCmd LossOccurrence with
+      cedant = tp.cedant
+      broker = tp.broker
+      adjuster = tp.adjuster
+      operations = tp.operations
+      audit = tp.audit
+      occurrenceRef = "OCC-2024-001"
+      dateOfOccurrence = date 2024 Feb 15
+      description = "Hurricane damage event"
+      memberClaimRefs = []
+      isFrozen = False
+      frozenAt = None
+      totalEligibleLoss = None
+      currency = USD
+      evidenceRefs = []
+      createdAt = now
+
+  -- Add claims
+  occ1 <- submit tp.cedant do
+    exerciseCmd occCid AddClaimToOccurrence with
+      claimRef = "CLM-2024-010"
+      addTime = now
+
+  occ2 <- submit tp.cedant do
+    exerciseCmd occ1 AddClaimToOccurrence with
+      claimRef = "CLM-2024-011"
+      addTime = now
+
+  occ3 <- submit tp.cedant do
+    exerciseCmd occ2 AddClaimToOccurrence with
+      claimRef = "CLM-2024-012"
+      addTime = now
+
+  -- Freeze membership
+  frozenCid <- submit tp.operations do
+    exerciseCmd occ3 FreezeOccurrence with
+      aggregatedLoss = usd 3500000.0
+      freezeTime = now
+
+  -- Cannot add more claims after freeze (normal path)
+  submitMustFail tp.cedant do
+    exerciseCmd frozenCid AddClaimToOccurrence with
+      claimRef = "CLM-2024-013"
+      addTime = now
+
+  return ()
+
+-- | Test: Late claim addition after freeze (controlled correction)
+testLateClaim : Script ()
+testLateClaim = do
+  tp <- setupParties
+  let now = time (date 2024 Mar 10) 10 0 0
+
+  occCid <- submit tp.cedant do
+    createCmd LossOccurrence with
+      cedant = tp.cedant
+      broker = tp.broker
+      adjuster = tp.adjuster
+      operations = tp.operations
+      audit = tp.audit
+      occurrenceRef = "OCC-2024-002"
+      dateOfOccurrence = date 2024 Feb 20
+      description = "Flood event"
+      memberClaimRefs = ["CLM-2024-020"]
+      isFrozen = False
+      frozenAt = None
+      totalEligibleLoss = None
+      currency = USD
+      evidenceRefs = []
+      createdAt = now
+
+  frozenCid <- submit tp.operations do
+    exerciseCmd occCid FreezeOccurrence with
+      aggregatedLoss = usd 1500000.0
+      freezeTime = now
+
+  -- Operations adds late claim with revised total
+  lateCid <- submit tp.operations do
+    exerciseCmd frozenCid AddLateClaim with
+      claimRef = "CLM-2024-021"
+      correctionReason = "Late reported damage to adjacent property"
+      newAggregatedLoss = usd 2000000.0
+      correctionTime = now
+
+  return ()
+
+-- | Test: Cannot add duplicate claim to occurrence
+testCannotAddDuplicateClaimToOccurrence : Script ()
+testCannotAddDuplicateClaimToOccurrence = do
+  tp <- setupParties
+  let now = time (date 2024 Mar 10) 10 0 0
+
+  occCid <- submit tp.cedant do
+    createCmd LossOccurrence with
+      cedant = tp.cedant
+      broker = tp.broker
+      adjuster = tp.adjuster
+      operations = tp.operations
+      audit = tp.audit
+      occurrenceRef = "OCC-2024-003"
+      dateOfOccurrence = date 2024 Feb 25
+      description = "Earthquake"
+      memberClaimRefs = []
+      isFrozen = False
+      frozenAt = None
+      totalEligibleLoss = None
+      currency = USD
+      evidenceRefs = []
+      createdAt = now
+
+  occ1 <- submit tp.cedant do
+    exerciseCmd occCid AddClaimToOccurrence with
+      claimRef = "CLM-2024-030"
+      addTime = now
+
+  -- Duplicate should fail
+  submitMustFail tp.cedant do
+    exerciseCmd occ1 AddClaimToOccurrence with
+      claimRef = "CLM-2024-030"
+      addTime = now
+
+  return ()
+
+-- =============================================================================
+-- REGISTRY / DUPLICATE PREVENTION TESTS
+-- =============================================================================
+
+-- | Test: Cannot create duplicate claim registry entry
+testDuplicateClaimRegistryPrevention : Script ()
+testDuplicateClaimRegistryPrevention = do
+  tp <- setupParties
+  let now = time (date 2024 Mar 1) 10 0 0
+
+  -- Register first claim
+  submit tp.operations do
+    createCmd ClaimRegistry with
+      registrar = tp.operations
+      cedant = tp.cedant
+      audit = tp.audit
+      claimRef = "CLM-2024-UNIQUE-001"
+      policyRef = "POL-001"
+      registeredAt = now
+      isActive = True
+
+  -- Duplicate should fail (same key)
+  submitMustFail tp.operations do
+    createCmd ClaimRegistry with
+      registrar = tp.operations
+      cedant = tp.cedant
+      audit = tp.audit
+      claimRef = "CLM-2024-UNIQUE-001"
+      policyRef = "POL-002"
+      registeredAt = now
+      isActive = True
+
+  return ()
+
+-- | Test: Cannot create duplicate allocation registry entry
+testDuplicateAllocationRegistryPrevention : Script ()
+testDuplicateAllocationRegistryPrevention = do
+  tp <- setupParties
+  let now = time (date 2024 Mar 1) 10 0 0
+
+  submit tp.operations do
+    createCmd AllocationRegistry with
+      registrar = tp.operations
+      cedant = tp.cedant
+      reinsurer = tp.reinsurer1
+      audit = tp.audit
+      claimRef = "CLM-2024-001"
+      treatyRef = "QS-2024-001"
+      treatyVersion = 1
+      allocationRef = "ALLOC-001"
+      registeredAt = now
+      isActive = True
+
+  -- Same claim + treaty + reinsurer combo should fail
+  submitMustFail tp.operations do
+    createCmd AllocationRegistry with
+      registrar = tp.operations
+      cedant = tp.cedant
+      reinsurer = tp.reinsurer1
+      audit = tp.audit
+      claimRef = "CLM-2024-001"
+      treatyRef = "QS-2024-001"
+      treatyVersion = 1
+      allocationRef = "ALLOC-002"
+      registeredAt = now
+      isActive = True
+
+  -- Different reinsurer should succeed (different key)
+  submit tp.operations do
+    createCmd AllocationRegistry with
+      registrar = tp.operations
+      cedant = tp.cedant
+      reinsurer = tp.reinsurer2
+      audit = tp.audit
+      claimRef = "CLM-2024-001"
+      treatyRef = "QS-2024-001"
+      treatyVersion = 1
+      allocationRef = "ALLOC-003"
+      registeredAt = now
+      isActive = True
+
+  return ()
+
+-- =============================================================================
+-- DISPUTE TESTS
+-- =============================================================================
+
+-- | Test: Dispute lifecycle
+testDisputeLifecycle : Script ()
+testDisputeLifecycle = do
+  tp <- setupParties
+  let now = time (date 2024 Apr 1) 10 0 0
+
+  -- Create dispute (requires both cedant and reinsurer as signatories)
+  disputeCid <- submitMulti [tp.cedant, tp.reinsurer1] [] do
+    createCmd DisputeCase with
+      cedant = tp.cedant
+      reinsurer = tp.reinsurer1
+      broker = tp.broker
+      operations = tp.operations
+      audit = tp.audit
+      disputeRef = "DISP-2024-001"
+      allocationRef = "ALLOC-001"
+      cycleRef = "CYCLE-001"
+      claimRef = "CLM-2024-001"
+      treatyRef = "QS-2024-001"
+      disputedAmount = Some (usd 50000.0)
+      originalAmount = usd 200000.0
+      reason = "Assessment methodology disputed"
+      supportingEvidence = []
+      disputeStatus = DisputeRaised
+      resolution = None
+      resolvedAmount = None
+      resolvedAt = None
+      resolvedBy = None
+      raisedAt = now
+      raisedBy = tp.reinsurer1
+
+  -- Move to review
+  reviewCid <- submit tp.operations do
+    exerciseCmd disputeCid SubmitDisputeForReview with
+      reviewTime = now
+
+  -- Resolve
+  resolvedCid <- submit tp.operations do
+    exerciseCmd reviewCid ResolveDispute with
+      resolutionText = "Revised calculation agreed by both parties"
+      finalAmount = usd 180000.0
+      resolveTime = now
+      resolver = tp.operations
+      resolutionEvidence = []
+
+  return ()
+
+-- =============================================================================
+-- SETTLEMENT TESTS
+-- =============================================================================
+
+-- | Test: Settlement lifecycle — cannot say "Paid" until confirmed
+testSettlementLifecycle : Script ()
+testSettlementLifecycle = do
+  tp <- setupParties
+  let now = time (date 2024 May 1) 10 0 0
+
+  settlementCid <- submitMulti [tp.cedant, tp.reinsurer1] [] do
+    createCmd RecoverableSettlement with
+      cedant = tp.cedant
+      reinsurer = tp.reinsurer1
+      broker = tp.broker
+      operations = tp.operations
+      audit = tp.audit
+      settlementRef = "SETT-2024-001"
+      allocationRef = "ALLOC-001"
+      cycleRef = "CYCLE-001"
+      claimRef = "CLM-2024-001"
+      treatyRef = "QS-2024-001"
+      amountDue = usd 200000.0
+      amountPaid = usd 0.0
+      amountOutstanding = usd 200000.0
+      currency = USD
+      dueDate = Some (date 2024 Jun 1)
+      settlementStatus = SettlementPending
+      isPartialSettlementPermitted = False
+      paymentEvidence = []
+      reconciliationRefs = []
+      createdAt = now
+      lastUpdatedAt = now
+
+  -- Cannot confirm before instruction
+  submitMustFail tp.operations do
+    exerciseCmd settlementCid ConfirmPayment with
+      confirmedAmount = usd 200000.0
+      evidence = testEvidence tp.operations now
+      confirmTime = now
+      confirmer = tp.operations
+
+  -- Instruct payment
+  instructedCid <- submit tp.operations do
+    exerciseCmd settlementCid InstructSettlement with
+      instructTime = now
+
+  -- Confirm full payment
+  confirmedCid <- submit tp.operations do
+    exerciseCmd instructedCid ConfirmPayment with
+      confirmedAmount = usd 200000.0
+      evidence = testEvidence tp.operations now
+      confirmTime = now
+      confirmer = tp.operations
+
+  return ()
+
+-- | Test: Cannot overpay settlement
+testCannotOverpaySettlement : Script ()
+testCannotOverpaySettlement = do
+  tp <- setupParties
+  let now = time (date 2024 May 1) 10 0 0
+
+  settlementCid <- submitMulti [tp.cedant, tp.reinsurer1] [] do
+    createCmd RecoverableSettlement with
+      cedant = tp.cedant
+      reinsurer = tp.reinsurer1
+      broker = tp.broker
+      operations = tp.operations
+      audit = tp.audit
+      settlementRef = "SETT-2024-002"
+      allocationRef = "ALLOC-002"
+      cycleRef = "CYCLE-001"
+      claimRef = "CLM-2024-002"
+      treatyRef = "QS-2024-001"
+      amountDue = usd 100000.0
+      amountPaid = usd 0.0
+      amountOutstanding = usd 100000.0
+      currency = USD
+      dueDate = None
+      settlementStatus = SettlementPending
+      isPartialSettlementPermitted = False
+      paymentEvidence = []
+      reconciliationRefs = []
+      createdAt = now
+      lastUpdatedAt = now
+
+  instructedCid <- submit tp.operations do
+    exerciseCmd settlementCid InstructSettlement with instructTime = now
+
+  -- Overpayment should fail
+  submitMustFail tp.operations do
+    exerciseCmd instructedCid ConfirmPayment with
+      confirmedAmount = usd 150000.0
+      evidence = testEvidence tp.operations now
+      confirmTime = now
+      confirmer = tp.operations
+
+  return ()
+
+-- | Test: Partial settlement only when permitted
+testPartialSettlementRestriction : Script ()
+testPartialSettlementRestriction = do
+  tp <- setupParties
+  let now = time (date 2024 May 1) 10 0 0
+
+  -- Settlement that does NOT permit partial
+  settlementCid <- submitMulti [tp.cedant, tp.reinsurer1] [] do
+    createCmd RecoverableSettlement with
+      cedant = tp.cedant
+      reinsurer = tp.reinsurer1
+      broker = tp.broker
+      operations = tp.operations
+      audit = tp.audit
+      settlementRef = "SETT-2024-003"
+      allocationRef = "ALLOC-003"
+      cycleRef = "CYCLE-002"
+      claimRef = "CLM-2024-003"
+      treatyRef = "QS-2024-001"
+      amountDue = usd 100000.0
+      amountPaid = usd 0.0
+      amountOutstanding = usd 100000.0
+      currency = USD
+      dueDate = None
+      settlementStatus = SettlementPending
+      isPartialSettlementPermitted = False
+      paymentEvidence = []
+      reconciliationRefs = []
+      createdAt = now
+      lastUpdatedAt = now
+
+  instructedCid <- submit tp.operations do
+    exerciseCmd settlementCid InstructSettlement with instructTime = now
+
+  -- Partial payment should fail when not permitted
+  submitMustFail tp.operations do
+    exerciseCmd instructedCid ConfirmPayment with
+      confirmedAmount = usd 50000.0
+      evidence = testEvidence tp.operations now
+      confirmTime = now
+      confirmer = tp.operations
+
+  return ()
+
+-- =============================================================================
+-- INTEGRATION: FULL WORKFLOW TEST
+-- =============================================================================
+
+-- | End-to-end test: Treaty → Claim → Assessment → Allocation → Settlement
+testFullWorkflow : Script ()
+testFullWorkflow = do
+  tp <- setupParties
+  let now = time (date 2024 Jan 15) 10 0 0
+
+  -- 1. Create and approve quota-share treaty
+  treatyCid <- submit tp.cedant do
+    createCmd TreatyVersion with
+      cedant = tp.cedant
+      broker = tp.broker
+      operations = tp.operations
+      audit = tp.audit
+      treatyRef = "QS-FULL-001"
+      version = 1
+      treatyType = QuotaShare
+      effectivePeriod = DateRange (date 2024 Jan 1) (date 2024 Dec 31)
+      coveredBusiness = "Property"
+      lossBasis = GrossLoss
+      currency = USD
+      cededPercentage = Some 70.0
+      contractualCap = Some 5000000.0
+      attachmentPoint = None
+      layerLimit = None
+      deductibleRules = "Standard"
+      eligibleLossMethod = "Gross loss"
+      approvalState = ApprovalPending
+      evidenceRefs = []
+      createdAt = now
+      previousVersion = None
+
+  approvedTreatyCid <- submit tp.cedant do
+    exerciseCmd treatyCid ApproveTreaty with
+      approver = tp.cedant
+      approvalTime = now
+
+  -- 2. Reinsurer participation
+  proposalCid <- submit tp.cedant do
+    createCmd TreatyParticipationProposal with
+      cedant = tp.cedant
+      reinsurer = tp.reinsurer1
+      broker = tp.broker
+      operations = tp.operations
+      audit = tp.audit
+      treatyVersionCid = approvedTreatyCid
+      treatyRef = "QS-FULL-001"
+      treatyVersion = 1
+      proposedLinePercentage = 60.0
+      coveredLayer = "100% ceded"
+      currency = USD
+      evidenceRefs = []
+      proposedAt = now
+
+  participationCid <- submit tp.reinsurer1 do
+    exerciseCmd proposalCid AcceptProposal with
+      acceptTime = now
+      acceptEvidence = None
+
+  -- 3. Register and submit claim
+  submit tp.operations do
+    createCmd ClaimRegistry with
+      registrar = tp.operations
+      cedant = tp.cedant
+      audit = tp.audit
+      claimRef = "CLM-FULL-001"
+      policyRef = "POL-FULL-100"
+      registeredAt = now
+      isActive = True
+
+  claimCid <- submit tp.cedant do
+    createCmd ClaimCase with
+      cedant = tp.cedant
+      broker = tp.broker
+      adjuster = tp.adjuster
+      operations = tp.operations
+      audit = tp.audit
+      claimRef = "CLM-FULL-001"
+      policyRef = "POL-FULL-100"
+      dateOfLoss = date 2024 Feb 15
+      occurrenceRef = None
+      grossAmount = usd 1000000.0
+      netAmount = None
+      applicableTreatyRefs = ["QS-FULL-001"]
+      claimStatus = ClaimSubmitted
+      evidenceRefs = [testEvidence tp.cedant now]
+      submittedAt = now
+      submittedBy = tp.cedant
+      lastUpdatedAt = now
+      notes = "Major fire incident"
+
+  assessingCid <- submit tp.cedant do
+    exerciseCmd claimCid SubmitForAssessment with submissionTime = now
+
+  -- 4. Loss assessment
+  assessmentCid <- submit tp.adjuster do
+    createCmd LossAssessment with
+      adjuster = tp.adjuster
+      cedant = tp.cedant
+      broker = tp.broker
+      operations = tp.operations
+      audit = tp.audit
+      claimRef = "CLM-FULL-001"
+      assessmentRef = "ASS-FULL-001"
+      assessmentVersion = 1
+      assessedAmount = usd 1000000.0
+      deductibleAmount = None
+      salvageAmount = None
+      subrogationAmount = None
+      otherRecoveries = None
+      eligibleLoss = usd 1000000.0
+      methodology = "Full site inspection"
+      lossBasisApplied = GrossLoss
+      evidenceRefs = [testEvidence tp.adjuster now]
+      assessmentStatus = AssessmentDraft
+      submittedAt = now
+      approvedAt = None
+      approvedBy = None
+      previousVersion = None
+      notes = ""
+
+  submittedAssessCid <- submit tp.adjuster do
+    exerciseCmd assessmentCid SubmitAssessment with submitTime = now
+
+  approvedAssessCid <- submit tp.operations do
+    exerciseCmd submittedAssessCid ApproveAssessment with
+      approver = tp.operations
+      approvalTime = now
+
+  -- 5. Mark claim as assessed
+  assessedClaimCid <- submit tp.operations do
+    exerciseCmd assessingCid MarkClaimAssessed with assessmentTime = now
+
+  -- 6. Allocation cycle
+  -- Quota-share: 70% ceded, Reinsurer1 has 60% line
+  -- Eligible loss = 1,000,000
+  -- Ceded amount = 1,000,000 × 70% = 700,000
+  -- Capped: min(700,000, 5,000,000) = 700,000
+  -- Reinsurer1 allocation = 700,000 × 60% = 420,000
+  let calcEvidence = CalculationEvidence with
+        formula = "QS: eligibleLoss × cededPct × reinsurerLine"
+        inputs =
+          [ ("eligibleLoss", "1000000.00")
+          , ("cededPercentage", "70.00")
+          , ("contractualCap", "5000000.00")
+          , ("reinsurerLine", "60.00")
+          ]
+        intermediates =
+          [ ("cededAmount", "700000.00")
+          , ("cappedCededAmount", "700000.00")
+          ]
+        roundingRule = RoundHalfEven
+        result = 420000.0
+        calculatedAt = now
+        calculatedBy = tp.operations
+
+  cycleCid <- submit tp.operations do
+    createCmd AllocationCycle with
+      operations = tp.operations
+      cedant = tp.cedant
+      broker = tp.broker
+      audit = tp.audit
+      cycleRef = "CYCLE-FULL-001"
+      claimRefs = ["CLM-FULL-001"]
+      occurrenceRef = None
+      assessmentRef = "ASS-FULL-001"
+      assessmentVersion = 1
+      treatyRef = "QS-FULL-001"
+      treatyVersion = 1
+      treatyType = QuotaShare
+      eligibleLoss = usd 1000000.0
+      calculatedRecoverable = usd 420000.0
+      calculationEvidence = calcEvidence
+      currency = USD
+      allocationStatus = AllocationProposed
+      createdAt = now
+      finalizedAt = None
+      evidenceRefs = []
+
+  -- Register allocation (duplicate prevention)
+  submit tp.operations do
+    createCmd AllocationRegistry with
+      registrar = tp.operations
+      cedant = tp.cedant
+      reinsurer = tp.reinsurer1
+      audit = tp.audit
+      claimRef = "CLM-FULL-001"
+      treatyRef = "QS-FULL-001"
+      treatyVersion = 1
+      allocationRef = "ALLOC-FULL-001"
+      registeredAt = now
+      isActive = True
+
+  -- Propose allocation to reinsurer
+  proposalAllocCid <- submit tp.cedant do
+    createCmd AllocationProposal with
+      cedant = tp.cedant
+      reinsurer = tp.reinsurer1
+      broker = tp.broker
+      operations = tp.operations
+      audit = tp.audit
+      allocationRef = "ALLOC-FULL-001"
+      cycleRef = "CYCLE-FULL-001"
+      treatyRef = "QS-FULL-001"
+      treatyVersion = 1
+      claimRef = "CLM-FULL-001"
+      occurrenceRef = None
+      allocatedAmount = usd 420000.0
+      linePercentage = 60.0
+      calculationEvidence = calcEvidence
+      evidenceRefs = []
+      proposedAt = now
+
+  -- Reinsurer accepts
+  allocationCid <- submit tp.reinsurer1 do
+    exerciseCmd proposalAllocCid AcceptAllocationProposal with
+      acceptTime = now
+      acceptEvidence = None
+
+  -- Finalize allocation
+  finalizedAllocCid <- submit tp.operations do
+    exerciseCmd allocationCid FinalizeAllocation with finalizeTime = now
+
+  -- 7. Settlement
+  settlementCid <- submitMulti [tp.cedant, tp.reinsurer1] [] do
+    createCmd RecoverableSettlement with
+      cedant = tp.cedant
+      reinsurer = tp.reinsurer1
+      broker = tp.broker
+      operations = tp.operations
+      audit = tp.audit
+      settlementRef = "SETT-FULL-001"
+      allocationRef = "ALLOC-FULL-001"
+      cycleRef = "CYCLE-FULL-001"
+      claimRef = "CLM-FULL-001"
+      treatyRef = "QS-FULL-001"
+      amountDue = usd 420000.0
+      amountPaid = usd 0.0
+      amountOutstanding = usd 420000.0
+      currency = USD
+      dueDate = Some (date 2024 Jun 1)
+      settlementStatus = SettlementPending
+      isPartialSettlementPermitted = False
+      paymentEvidence = []
+      reconciliationRefs = []
+      createdAt = now
+      lastUpdatedAt = now
+
+  instructedCid <- submit tp.operations do
+    exerciseCmd settlementCid InstructSettlement with instructTime = now
+
+  confirmedCid <- submit tp.operations do
+    exerciseCmd instructedCid ConfirmPayment with
+      confirmedAmount = usd 420000.0
+      evidence = testEvidence tp.operations now
+      confirmTime = now
+      confirmer = tp.operations
+
+  return ()

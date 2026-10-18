@@ -1,0 +1,96 @@
+-- | ReSure Nexus — Treaty and Participation contracts.
+-- | Implements TreatyVersion and TreatyParticipation as per spec sections A.
+-- | Material amendments create new versions; no silent rewriting.
+module ReSure.Treaty.TreatyVersion where
+
+import ReSure.Types
+import DA.Optional (isSome)
+
+-- | TreatyVersion — Immutable, versioned set of contractual terms.
+-- | Signatory: cedant (treaty owner)
+-- | Observer: broker, operations, audit (read access)
+-- | Reinsurers are NOT observers — they see terms via TreatyParticipation
+template TreatyVersion
+  with
+    cedant : Party
+    broker : Party
+    operations : Party
+    audit : Party
+    treatyRef : Text            -- External treaty reference
+    version : Int               -- Monotonically increasing version number
+    treatyType : TreatyType
+    effectivePeriod : DateRange
+    coveredBusiness : Text      -- Description of covered lines
+    lossBasis : LossBasis
+    currency : Currency
+    -- Quota-share specific
+    cededPercentage : Optional Decimal     -- For quota-share treaties
+    contractualCap : Optional Decimal      -- Optional cap on ceded amount
+    -- Excess-of-loss specific
+    attachmentPoint : Optional Decimal     -- XoL attachment point
+    layerLimit : Optional Decimal          -- XoL per-occurrence layer limit
+    -- Common fields
+    deductibleRules : Text       -- Text description of applicable deductible/retention
+    eligibleLossMethod : Text    -- Calculation method description
+    approvalState : ApprovalState
+    evidenceRefs : [EvidenceRef] -- Source document references
+    createdAt : Time
+    previousVersion : Optional (ContractId TreatyVersion)  -- Link to prior version
+  where
+    signatory cedant
+    observer broker, operations, audit
+
+    -- | Ensure treaty reference is not empty
+    ensure treatyRef /= "" &&
+           version > 0 &&
+           -- Quota-share must have ceded percentage
+           (treatyType /= QuotaShare || isSome cededPercentage) &&
+           -- XoL must have attachment point and layer limit
+           (treatyType /= ExcessOfLoss || (isSome attachmentPoint && isSome layerLimit))
+
+    -- | Approve treaty version — makes it effective for allocations
+    choice ApproveTreaty : ContractId TreatyVersion
+      with
+        approver : Party
+        approvalTime : Time
+      controller cedant
+      do
+        assertMsg "Only pending treaties can be approved" (approvalState == ApprovalPending)
+        create this with
+          approvalState = ApprovalEffective
+
+    -- | Supersede this version with a new amended version
+    choice SupersedeTreatyVersion : (ContractId TreatyVersion, ContractId TreatyVersion)
+      with
+        newTreatyData : TreatyVersion
+        amendmentTime : Time
+      controller cedant
+      do
+        assertMsg "Only effective treaties can be superseded" (approvalState == ApprovalEffective)
+        -- Archive old version by creating superseded record
+        supersededId <- create this with approvalState = ApprovalSuperseded
+        -- Create new version
+        newId <- create newTreatyData with
+          version = version + 1
+          previousVersion = Some supersededId
+          approvalState = ApprovalPending
+          createdAt = amendmentTime
+        return (supersededId, newId)
+
+    -- | Terminate treaty
+    choice TerminateTreaty : ContractId TreatyVersion
+      with
+        terminationTime : Time
+        reason : Text
+      controller cedant
+      do
+        assertMsg "Only effective treaties can be terminated" (approvalState == ApprovalEffective)
+        create this with approvalState = ApprovalTerminated
+
+    -- | Add evidence reference to treaty
+    choice AddTreatyEvidence : ContractId TreatyVersion
+      with
+        evidence : EvidenceRef
+      controller cedant
+      do
+        create this with evidenceRefs = evidence :: evidenceRefs

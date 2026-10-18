@@ -1,0 +1,152 @@
+-- | ReSure Nexus — Core domain types shared across all modules.
+-- | All monetary amounts use Decimal (fixed-point) to avoid floating-point errors.
+module ReSure.Types where
+
+-- | Currency codes (ISO 4217)
+data Currency = USD | EUR | GBP | CHF | JPY | CAD | AUD | SGD | HKD | Other Text
+  deriving (Eq, Show, Ord)
+
+-- | Treaty type classification
+data TreatyType = QuotaShare | ExcessOfLoss | SurplusShare | StopLoss
+  deriving (Eq, Show)
+
+-- | Loss basis — determines what deductions apply before eligible loss
+data LossBasis
+  = GrossLoss                -- No deductions
+  | NetOfDeductible          -- After policyholder deductible
+  | NetOfSalvageSubrogation  -- After salvage and subrogation
+  | NetOfAll                 -- After all specified deductions
+  | CustomBasis Text         -- Contract-specific basis
+  deriving (Eq, Show)
+
+-- | Claim lifecycle states
+data ClaimStatus
+  = ClaimSubmitted
+  | ClaimUnderAssessment
+  | ClaimAssessed
+  | ClaimAllocated
+  | ClaimPartiallySettled
+  | ClaimFullySettled
+  | ClaimClosed
+  | ClaimReopened
+  deriving (Eq, Show)
+
+-- | Assessment authorization state
+data AssessmentStatus
+  = AssessmentDraft
+  | AssessmentSubmitted
+  | AssessmentApproved
+  | AssessmentRejected
+  | AssessmentSuperseded
+  deriving (Eq, Show)
+
+-- | Allocation cycle state
+data AllocationStatus
+  = AllocationProposed
+  | AllocationPendingReinsurer
+  | AllocationAccepted
+  | AllocationDisputed
+  | AllocationFinalized
+  | AllocationAdjusted
+  deriving (Eq, Show)
+
+-- | Reinsurer decision type
+data DecisionType
+  = DecisionAccept
+  | DecisionDispute
+  | DecisionRequestInfo
+  deriving (Eq, Show)
+
+-- | Settlement lifecycle
+data SettlementStatus
+  = SettlementPending
+  | SettlementInstructed
+  | SettlementConfirmed
+  | SettlementPartiallyPaid
+  | SettlementReconciled
+  | SettlementOverdue
+  deriving (Eq, Show)
+
+-- | Dispute lifecycle
+data DisputeStatus
+  = DisputeRaised
+  | DisputeUnderReview
+  | DisputeResolved
+  | DisputeEscalated
+  | DisputeWithdrawn
+  deriving (Eq, Show)
+
+-- | Evidence document type classification
+data DocumentType
+  = PolicySchedule
+  | ClaimNotification
+  | LossAdjusterReport
+  | SalvageReport
+  | SubrogationReport
+  | TreatySlip
+  | EndorsementSlip
+  | BordereauExtract
+  | PaymentAdvice
+  | SettlementConfirmation
+  | AuditReport
+  | OtherDocument Text
+  deriving (Eq, Show)
+
+-- | Evidence reference for documents stored off-ledger
+data EvidenceRef = EvidenceRef with
+    documentId : Text         -- Opaque storage identifier
+    documentType : DocumentType
+    contentHash : Text        -- SHA-256 hex digest
+    version : Int             -- Document version
+    uploadedAt : Time         -- Upload timestamp
+    uploadedBy : Party        -- Uploader party
+  deriving (Eq, Show)
+
+-- | Monetary amount with currency validation
+data MonetaryAmount = MonetaryAmount with
+    amount : Decimal          -- Fixed-point, no floating-point
+    currency : Currency
+  deriving (Eq, Show)
+
+-- | Date range for treaty effective periods
+data DateRange = DateRange with
+    startDate : Date
+    endDate : Date
+  deriving (Eq, Show)
+
+-- | Rounding rule for allocation residuals
+data RoundingRule
+  = RoundHalfUp
+  | RoundHalfDown
+  | RoundHalfEven       -- Banker's rounding
+  | RoundDown           -- Truncate
+  | ResidualToLeadReinsurer
+  deriving (Eq, Show)
+
+-- | Calculation evidence for audit trail
+data CalculationEvidence = CalculationEvidence with
+    formula : Text            -- Human-readable formula description
+    inputs : [(Text, Text)]   -- Named input values
+    intermediates : [(Text, Text)]  -- Named intermediate values
+    roundingRule : RoundingRule
+    result : Decimal
+    calculatedAt : Time
+    calculatedBy : Party
+  deriving (Eq, Show)
+
+-- | Adjustment type classification
+data AdjustmentType
+  = SalvageRecovery
+  | SubrogationRecovery
+  | RevisedAssessment
+  | CorrectedCalculation
+  | ContractualAdjustment Text
+  deriving (Eq, Show)
+
+-- | Treaty approval state
+data ApprovalState
+  = ApprovalPending
+  | ApprovalEffective
+  | ApprovalSuperseded
+  | ApprovalTerminated
+  deriving (Eq, Show)

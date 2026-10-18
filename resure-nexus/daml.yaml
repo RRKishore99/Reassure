@@ -1,0 +1,10 @@
+sdk-version: 2.10.4
+name: resure-nexus
+source: daml/src
+version: 1.0.0
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script
+build-options:
+  - --target=1.15

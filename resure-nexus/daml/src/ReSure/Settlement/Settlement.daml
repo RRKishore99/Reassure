@@ -1,0 +1,168 @@
+-- | ReSure Nexus — Settlement and Reconciliation contracts.
+-- | RecoverableSettlement, SettlementReconciliation as per spec D.
+-- | Payment instruction ≠ payment confirmation ≠ settlement.
+module ReSure.Settlement.Settlement where
+
+import ReSure.Types
+
+-- | RecoverableSettlement — Tracks settlement lifecycle for an accepted allocation.
+-- | Bilateral: cedant + reinsurer.
+template RecoverableSettlement
+  with
+    cedant : Party
+    reinsurer : Party
+    broker : Party
+    operations : Party
+    audit : Party
+    settlementRef : Text         -- Unique settlement reference
+    allocationRef : Text         -- Associated allocation
+    cycleRef : Text              -- Associated allocation cycle
+    claimRef : Text
+    treatyRef : Text
+    -- Settlement amounts
+    amountDue : MonetaryAmount          -- Full amount owed
+    amountPaid : MonetaryAmount         -- Amount confirmed paid so far
+    amountOutstanding : MonetaryAmount  -- Remaining balance
+    currency : Currency
+    dueDate : Optional Date           -- Settlement due date
+    -- Status
+    settlementStatus : SettlementStatus
+    isPartialSettlementPermitted : Bool
+    -- Evidence
+    paymentEvidence : [EvidenceRef]
+    reconciliationRefs : [Text]  -- Linked reconciliation records
+    createdAt : Time
+    lastUpdatedAt : Time
+  where
+    signatory cedant, reinsurer
+    observer broker, operations, audit
+
+    ensure settlementRef /= "" &&
+           allocationRef /= "" &&
+           amountDue.amount >= 0.0 &&
+           amountPaid.amount >= 0.0 &&
+           amountOutstanding.amount >= 0.0
+
+    -- | Mark settlement as instructed (payment instruction sent)
+    choice InstructSettlement : ContractId RecoverableSettlement
+      with
+        instructTime : Time
+      controller operations
+      do
+        assertMsg "Settlement must be Pending" (settlementStatus == SettlementPending)
+        create this with
+          settlementStatus = SettlementInstructed
+          lastUpdatedAt = instructTime
+
+    -- | Confirm full or partial payment — requires evidence
+    -- | A submitted payment instruction is NOT evidence that cash has moved.
+    choice ConfirmPayment : ContractId RecoverableSettlement
+      with
+        confirmedAmount : MonetaryAmount
+        evidence : EvidenceRef
+        confirmTime : Time
+        confirmer : Party
+      controller operations
+      do
+        assertMsg "Settlement must be Instructed or PartiallyPaid"
+          (settlementStatus == SettlementInstructed || settlementStatus == SettlementPartiallyPaid)
+        assertMsg "Confirmed amount must be positive" (confirmedAmount.amount > 0.0)
+        assertMsg "Currency must match" (confirmedAmount.currency == currency)
+        assertMsg "Only operations can confirm payment" (confirmer == operations)
+        let newPaid = MonetaryAmount
+              { amount = amountPaid.amount + confirmedAmount.amount
+              , currency = currency
+              }
+        let newOutstanding = MonetaryAmount
+              { amount = amountDue.amount - newPaid.amount
+              , currency = currency
+              }
+        assertMsg "Cannot overpay" (newOutstanding.amount >= 0.0)
+        let newStatus = if newOutstanding.amount == 0.0
+              then SettlementConfirmed
+              else SettlementPartiallyPaid
+        assertMsg "Partial settlement must be permitted or this must be full payment"
+          (isPartialSettlementPermitted || newStatus == SettlementConfirmed)
+        create this with
+          amountPaid = newPaid
+          amountOutstanding = newOutstanding
+          settlementStatus = newStatus
+          paymentEvidence = evidence :: paymentEvidence
+          lastUpdatedAt = confirmTime
+
+    -- | Mark settlement as overdue
+    choice MarkSettlementOverdue : ContractId RecoverableSettlement
+      with
+        overdueTime : Time
+      controller operations
+      do
+        assertMsg "Only pending or instructed settlements can be marked overdue"
+          (settlementStatus == SettlementPending || settlementStatus == SettlementInstructed)
+        create this with
+          settlementStatus = SettlementOverdue
+          lastUpdatedAt = overdueTime
+
+    -- | Reconcile settlement with external confirmation
+    choice ReconcileSettlement : ContractId RecoverableSettlement
+      with
+        reconciliationRef : Text
+        reconcileTime : Time
+      controller operations
+      do
+        assertMsg "Settlement must be Confirmed" (settlementStatus == SettlementConfirmed)
+        assertMsg "Reconciliation reference cannot be empty" (reconciliationRef /= "")
+        create this with
+          settlementStatus = SettlementReconciled
+          reconciliationRefs = reconciliationRef :: reconciliationRefs
+          lastUpdatedAt = reconcileTime
+
+    -- | Add payment evidence
+    choice AddPaymentEvidence : ContractId RecoverableSettlement
+      with
+        evidence : EvidenceRef
+        submitter : Party
+      controller submitter
+      do
+        assertMsg "Only operations or cedant can add evidence"
+          (submitter == operations || submitter == cedant)
+        create this with paymentEvidence = evidence :: paymentEvidence
+
+
+-- | SettlementReconciliation — Confirmed settlement with external evidence.
+-- | Records actual payment confirmation, not just instructions.
+template SettlementReconciliation
+  with
+    operations : Party
+    cedant : Party
+    reinsurer : Party
+    audit : Party
+    reconciliationRef : Text     -- Unique reconciliation reference
+    settlementRef : Text         -- Associated settlement
+    allocationRef : Text
+    -- Confirmation details
+    confirmedReference : Text    -- External payment/bank reference
+    sourceEvidence : EvidenceRef -- Payment confirmation document
+    confirmationTime : Time
+    reconciledAmount : MonetaryAmount
+    outstandingAmount : MonetaryAmount  -- Any remaining balance
+    reconciledBy : Party
+    isFullyReconciled : Bool
+    createdAt : Time
+  where
+    signatory operations
+    observer cedant, reinsurer, audit
+
+    ensure reconciliationRef /= "" &&
+           settlementRef /= "" &&
+           confirmedReference /= "" &&
+           reconciledAmount.amount >= 0.0
+
+    -- | Mark as fully reconciled
+    choice MarkFullyReconciled : ContractId SettlementReconciliation
+      with
+        reconcileTime : Time
+      controller operations
+      do
+        assertMsg "Outstanding amount must be zero for full reconciliation"
+          (outstandingAmount.amount == 0.0)
+        create this with isFullyReconciled = True

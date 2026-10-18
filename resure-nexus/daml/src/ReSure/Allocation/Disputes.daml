@@ -1,0 +1,168 @@
+-- | ReSure Nexus — Dispute and Recovery Adjustment contracts.
+-- | DisputeCase as per spec C; RecoveryAdjustment preserving original history.
+module ReSure.Allocation.Disputes where
+
+import ReSure.Types
+
+-- | DisputeCase — Records a dispute against an allocation.
+-- | Bilateral: cedant + disputing reinsurer.
+template DisputeCase
+  with
+    cedant : Party
+    reinsurer : Party
+    broker : Party
+    operations : Party
+    audit : Party
+    disputeRef : Text            -- Unique dispute reference
+    allocationRef : Text         -- Disputed allocation reference
+    cycleRef : Text              -- Related allocation cycle
+    claimRef : Text              -- Related claim
+    treatyRef : Text
+    -- Dispute details
+    disputedAmount : Optional MonetaryAmount  -- Amount in dispute
+    originalAmount : MonetaryAmount          -- Original allocation amount
+    reason : Text                -- Detailed dispute reason
+    supportingEvidence : [EvidenceRef]
+    -- Status
+    disputeStatus : DisputeStatus
+    resolution : Optional Text   -- Resolution description
+    resolvedAmount : Optional MonetaryAmount  -- Final resolved amount
+    resolvedAt : Optional Time
+    resolvedBy : Optional Party
+    raisedAt : Time
+    raisedBy : Party
+  where
+    signatory cedant, reinsurer
+    observer broker, operations, audit
+
+    ensure disputeRef /= "" &&
+           allocationRef /= "" &&
+           reason /= ""
+
+    -- | Submit dispute for review
+    choice SubmitDisputeForReview : ContractId DisputeCase
+      with
+        reviewTime : Time
+      controller operations
+      do
+        assertMsg "Dispute must be in Raised state" (disputeStatus == DisputeRaised)
+        create this with disputeStatus = DisputeUnderReview
+
+    -- | Resolve dispute
+    choice ResolveDispute : ContractId DisputeCase
+      with
+        resolutionText : Text
+        finalAmount : MonetaryAmount
+        resolveTime : Time
+        resolver : Party
+        resolutionEvidence : [EvidenceRef]
+      controller operations
+      do
+        assertMsg "Dispute must be under review or raised"
+          (disputeStatus == DisputeUnderReview || disputeStatus == DisputeRaised)
+        create this with
+          disputeStatus = DisputeResolved
+          resolution = Some resolutionText
+          resolvedAmount = Some finalAmount
+          resolvedAt = Some resolveTime
+          resolvedBy = Some resolver
+          supportingEvidence = resolutionEvidence <> supportingEvidence
+
+    -- | Escalate dispute
+    choice EscalateDispute : ContractId DisputeCase
+      with
+        escalationReason : Text
+        escalateTime : Time
+      controller operations
+      do
+        assertMsg "Dispute must be under review"
+          (disputeStatus == DisputeUnderReview)
+        create this with
+          disputeStatus = DisputeEscalated
+          reason = reason <> " | Escalated: " <> escalationReason
+
+    -- | Withdraw dispute (by reinsurer)
+    choice WithdrawDispute : ContractId DisputeCase
+      with
+        withdrawalReason : Text
+        withdrawTime : Time
+      controller reinsurer
+      do
+        assertMsg "Only raised or under review disputes can be withdrawn"
+          (disputeStatus == DisputeRaised || disputeStatus == DisputeUnderReview)
+        create this with
+          disputeStatus = DisputeWithdrawn
+          resolution = Some ("Withdrawn: " <> withdrawalReason)
+          resolvedAt = Some withdrawTime
+
+    -- | Add supporting evidence
+    choice AddDisputeEvidence : ContractId DisputeCase
+      with
+        evidence : EvidenceRef
+        submitter : Party
+      controller submitter
+      do
+        assertMsg "Only cedant, reinsurer, or operations can add evidence"
+          (submitter == cedant || submitter == reinsurer || submitter == operations)
+        create this with supportingEvidence = evidence :: supportingEvidence
+
+
+-- | RecoveryAdjustment — Records changes after finalization.
+-- | References predecessor; preserves original calculation history.
+template RecoveryAdjustment
+  with
+    operations : Party
+    cedant : Party
+    reinsurer : Party
+    broker : Party
+    audit : Party
+    adjustmentRef : Text         -- Unique adjustment reference
+    allocationRef : Text         -- Original allocation being adjusted
+    cycleRef : Text              -- Original cycle
+    claimRef : Text
+    treatyRef : Text
+    -- Adjustment details
+    adjustmentType : AdjustmentType
+    originalAmount : MonetaryAmount     -- Original allocated amount
+    adjustmentAmount : MonetaryAmount   -- Adjustment (positive = increase, negative = decrease)
+    revisedAmount : MonetaryAmount      -- New total after adjustment
+    reason : Text
+    calculationEvidence : CalculationEvidence
+    -- Lineage
+    predecessorRef : Optional Text      -- Previous adjustment in chain
+    predecessorVersion : Int            -- Chain version
+    -- Evidence
+    evidenceRefs : [EvidenceRef]
+    isApproved : Bool
+    approvedAt : Optional Time
+    approvedBy : Optional Party
+    createdAt : Time
+  where
+    signatory operations
+    observer cedant, reinsurer, broker, audit
+
+    ensure adjustmentRef /= "" &&
+           allocationRef /= "" &&
+           reason /= "" &&
+           predecessorVersion >= 0
+
+    -- | Approve adjustment
+    choice ApproveAdjustment : ContractId RecoveryAdjustment
+      with
+        approver : Party
+        approvalTime : Time
+      controller operations
+      do
+        assertMsg "Adjustment already approved" (not isApproved)
+        create this with
+          isApproved = True
+          approvedAt = Some approvalTime
+          approvedBy = Some approver
+
+    -- | Add evidence to adjustment
+    choice AddAdjustmentEvidence : ContractId RecoveryAdjustment
+      with
+        evidence : EvidenceRef
+      controller operations
+      do
+        create this with evidenceRefs = evidence :: evidenceRefs
